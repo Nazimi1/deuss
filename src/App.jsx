@@ -1,9 +1,6 @@
-import React, { useState, useEffect } from "react";
-import {
-  LayoutGrid, Calendar as CalIcon, Users, Euro, History as HistoryIcon,
-  CheckCircle2, XCircle, CalendarDays, Plus, Trash2, Clock, MapPin,
-  TrendingUp, Award, X, ChevronLeft, ChevronRight, Edit3, Package
-} from "lucide-react";
+import React, { useState, useEffect, useCallback } from "react";
+import { LayoutGrid, Calendar as CalIcon, Users, Euro, History as HistoryIcon, CircleCheck as CheckCircle2, Circle as XCircle, CalendarDays, Plus, Trash2, Clock, MapPin, TrendingUp, Award, X, ChevronLeft, ChevronRight, CreditCard as Edit3, Package } from "lucide-react";
+import { supabase } from "./supabase.js";
 
 /* ============================================================
    Deuss Studio — Massage CRM
@@ -53,22 +50,58 @@ const coversRow = (start, rowHour) => overlaps(start, rowHour);
 const GOLD = "#c9a227";
 const GOLD_LIGHT = "#e6c45a";
 
-/* ---------- Storage helpers (localStorage) ---------- */
-const KEYS = { clients: "deuss:clients", bookings: "deuss:bookings", history: "deuss:history" };
+/* ---------- Supabase data helpers ---------- */
+const uid = () => crypto.randomUUID();
 
-async function loadKey(key, fallback) {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-async function saveKey(key, value) {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { console.error(e); }
+async function loadClients() {
+  const { data, error } = await supabase.from("clients").select("*, packages(*)").order("created_at", { ascending: false });
+  if (error) { console.error("loadClients", error); return []; }
+  return data.map((c) => ({
+    id: c.id,
+    name: c.name,
+    phone: c.phone || "",
+    soldBy: c.sold_by,
+    createdAt: new Date(c.created_at).getTime(),
+    packages: (c.packages || []).map((p) => ({
+      id: p.id,
+      service: p.service,
+      sessions: p.sessions,
+      sessionsUsed: p.sessions_used,
+      paid: Number(p.paid),
+      perSession: Number(p.per_session),
+    })),
+  }));
 }
 
-const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+async function loadBookings() {
+  const { data, error } = await supabase.from("bookings").select("*").order("created_at", { ascending: false });
+  if (error) { console.error("loadBookings", error); return []; }
+  return data.map((b) => ({
+    id: b.id,
+    clientId: b.client_id,
+    packageId: b.package_id,
+    clientName: b.client_name,
+    therapist: b.therapist,
+    service: b.service,
+    room: b.room,
+    date: b.date,
+    time: b.time,
+    status: b.status,
+    revenue: Number(b.revenue),
+    createdAt: new Date(b.created_at).getTime(),
+  }));
+}
+
+async function loadHistory() {
+  const { data, error } = await supabase.from("history").select("*").order("ts", { ascending: false }).limit(500);
+  if (error) { console.error("loadHistory", error); return []; }
+  return data.map((h) => ({
+    id: h.id,
+    type: h.type,
+    message: h.message,
+    ts: new Date(h.ts).getTime(),
+  }));
+}
 const fmtEuro = (n) => `€${(Number(n) || 0).toFixed(2)}`;
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const niceDate = (iso) => {
@@ -81,25 +114,6 @@ const niceDateTime = (ts) =>
 const therapistColor = (name) => THERAPISTS.find((t) => t.name === name)?.color || GOLD;
 const therapistSoft = (name) => THERAPISTS.find((t) => t.name === name)?.soft || "rgba(201,162,39,0.15)";
 
-// Backward-compat: convert old single-package clients into the packages[] shape
-function migrateClient(c) {
-  if (Array.isArray(c.packages)) return c;
-  return {
-    id: c.id,
-    name: c.name,
-    phone: c.phone,
-    soldBy: c.soldBy,
-    createdAt: c.createdAt,
-    packages: [{
-      id: uid(),
-      service: c.service,
-      sessions: c.sessions || 0,
-      sessionsUsed: c.sessionsUsed || 0,
-      paid: c.paid || 0,
-      perSession: c.perSession || 0,
-    }],
-  };
-}
 
 /* ============================================================
    Root
@@ -110,68 +124,76 @@ export default function App() {
   const [bookings, setBookings] = useState([]);
   const [history, setHistory] = useState([]);
   const [loaded, setLoaded] = useState(false);
-  const [cancelTarget, setCancelTarget] = useState(null); // booking awaiting cancel confirmation
+  const [cancelTarget, setCancelTarget] = useState(null);
 
-  useEffect(() => {
-    (async () => {
-      const [c, b, h] = await Promise.all([
-        loadKey(KEYS.clients, []),
-        loadKey(KEYS.bookings, []),
-        loadKey(KEYS.history, []),
-      ]);
-      setClients(c.map(migrateClient)); setBookings(b); setHistory(h);
-      setLoaded(true);
-    })();
+  const reload = useCallback(async () => {
+    const [c, b, h] = await Promise.all([loadClients(), loadBookings(), loadHistory()]);
+    setClients(c); setBookings(b); setHistory(h);
   }, []);
 
-  useEffect(() => { if (loaded) saveKey(KEYS.clients, clients); }, [clients, loaded]);
-  useEffect(() => { if (loaded) saveKey(KEYS.bookings, bookings); }, [bookings, loaded]);
-  useEffect(() => { if (loaded) saveKey(KEYS.history, history); }, [history, loaded]);
+  useEffect(() => { reload().then(() => setLoaded(true)); }, [reload]);
 
-  const log = (type, message) =>
+  const log = async (type, message) => {
+    await supabase.from("history").insert({ type, message });
     setHistory((h) => [{ id: uid(), type, message, ts: Date.now() }, ...h].slice(0, 500));
+  };
 
   /* ----- Client operations ----- */
-  const addClient = (data) => {
+  const addClient = async (data) => {
+    const clientId = uid();
     const packages = data.packages.map((p) => {
       const sessions = Number(p.sessions);
       const paid = Number(p.paid);
       return {
         id: uid(),
+        client_id: clientId,
         service: p.service,
         sessions,
-        sessionsUsed: 0,
+        sessions_used: 0,
         paid,
-        perSession: sessions > 0 ? paid / sessions : 0,
+        per_session: sessions > 0 ? paid / sessions : 0,
       };
     });
+
+    const { error: ce } = await supabase.from("clients").insert({
+      id: clientId, name: data.name, phone: data.phone, sold_by: data.soldBy,
+    });
+    if (ce) { console.error(ce); return; }
+
+    const { error: pe } = await supabase.from("packages").insert(packages);
+    if (pe) { console.error(pe); return; }
+
     const client = {
-      id: uid(),
+      id: clientId,
       name: data.name,
       phone: data.phone,
       soldBy: data.soldBy,
-      packages,
+      packages: packages.map((p) => ({
+        id: p.id, service: p.service, sessions: p.sessions,
+        sessionsUsed: 0, paid: p.paid, perSession: p.per_session,
+      })),
       createdAt: Date.now(),
     };
     setClients((c) => [client, ...c]);
+
     const summary = packages.map((p) => `${p.sessions} ${p.service}`).join(" + ");
     const total = packages.reduce((s, p) => s + p.paid, 0);
     log("client_added",
       `Added client ${client.name} — ${summary}, paid ${fmtEuro(total)} · sold by ${client.soldBy}`);
   };
 
-  const deleteClient = (id) => {
+  const deleteClient = async (id) => {
     const cl = clients.find((c) => c.id === id);
+    await supabase.from("clients").delete().eq("id", id);
     setClients((c) => c.filter((x) => x.id !== id));
     setBookings((b) => b.filter((x) => x.clientId !== id));
     if (cl) log("client_deleted", `Deleted client ${cl.name}`);
   };
 
-  const editClient = (id, data) => {
+  const editClient = async (id, data) => {
     const old = clients.find((c) => c.id === id);
     if (!old) return;
 
-    // Rebuild packages: keep id + sessionsUsed for existing ones, mint ids for new ones
     const newPackages = data.packages.map((p) => {
       const sessions = Number(p.sessions);
       const paid = Number(p.paid);
@@ -187,11 +209,26 @@ export default function App() {
       };
     });
 
+    await supabase.from("clients").update({ name: data.name, phone: data.phone, sold_by: data.soldBy }).eq("id", id);
+
+    const oldPkgIds = new Set(old.packages.map((p) => p.id));
+    const newPkgIds = new Set(newPackages.map((p) => p.id));
+    const removedPkgIds = [...oldPkgIds].filter((pid) => !newPkgIds.has(pid));
+    if (removedPkgIds.length) await supabase.from("packages").delete().in("id", removedPkgIds);
+
+    for (const np of newPackages) {
+      const row = { client_id: id, service: np.service, sessions: np.sessions, sessions_used: np.sessionsUsed, paid: np.paid, per_session: np.perSession };
+      if (oldPkgIds.has(np.id)) {
+        await supabase.from("packages").update(row).eq("id", np.id);
+      } else {
+        await supabase.from("packages").insert({ ...row, id: np.id });
+      }
+    }
+
     setClients((cs) => cs.map((c) => c.id === id
       ? { ...c, name: data.name, phone: data.phone, soldBy: data.soldBy, packages: newPackages }
       : c));
 
-    // Build a readable change summary for History
     const changes = [];
     if (old.name !== data.name) changes.push(`name ${old.name} → ${data.name}`);
     if ((old.phone || "") !== (data.phone || "")) changes.push(`phone → ${data.phone || "—"}`);
@@ -221,11 +258,12 @@ export default function App() {
   };
 
   /* ----- Booking operations ----- */
-  const addBooking = (data) => {
+  const addBooking = async (data) => {
     const client = clients.find((c) => c.id === data.clientId);
     const pkg = client?.packages.find((p) => p.id === data.packageId);
+    const id = uid();
     const booking = {
-      id: uid(),
+      id,
       clientId: data.clientId,
       packageId: data.packageId,
       clientName: client?.name || "—",
@@ -234,61 +272,76 @@ export default function App() {
       room: data.room,
       date: data.date,
       time: data.time,
-      status: "booked", // booked | done | cancelled
+      status: "booked",
       revenue: pkg?.perSession || 0,
       createdAt: Date.now(),
     };
+
+    await supabase.from("bookings").insert({
+      id, client_id: data.clientId, package_id: data.packageId,
+      client_name: booking.clientName, therapist: data.therapist,
+      service: booking.service, room: data.room, date: data.date,
+      time: data.time, status: "booked", revenue: booking.revenue,
+    });
+
     setBookings((b) => [...b, booking]);
     log("booking_added",
       `Booked ${booking.clientName} (${booking.service}) with ${booking.therapist} • ${booking.room} • ${niceDate(booking.date)} ${booking.time}`);
   };
 
-  const completeBooking = (id) => {
+  const completeBooking = async (id) => {
     const done = bookings.find((x) => x.id === id);
     if (!done) return;
+
+    await supabase.from("bookings").update({ status: "done" }).eq("id", id);
     setBookings((b) => b.map((x) => (x.id === id ? { ...x, status: "done" } : x)));
+
     let counter = "";
-    // increment sessions used on the matching package
+    const cl = clients.find((x) => x.id === done.clientId);
+    const p = cl?.packages.find((pp) => pp.id === done.packageId);
+    if (p) {
+      const newUsed = Math.min(p.sessions, p.sessionsUsed + 1);
+      counter = `${newUsed}/${p.sessions}`;
+      await supabase.from("packages").update({ sessions_used: newUsed }).eq("id", done.packageId);
+    }
+
     setClients((c) => c.map((cl) => {
       if (cl.id !== done.clientId) return cl;
       const packages = cl.packages.map((p) => {
         if (p.id !== done.packageId) return p;
         const used = Math.min(p.sessions, p.sessionsUsed + 1);
-        counter = `${used}/${p.sessions}`;
         return { ...p, sessionsUsed: used };
       });
       return { ...cl, packages };
     }));
-    // compute counter from current state too (don't rely on async setClients)
-    if (!counter) {
-      const cl = clients.find((x) => x.id === done.clientId);
-      const p = cl?.packages.find((pp) => pp.id === done.packageId);
-      if (p) counter = `${Math.min(p.sessions, p.sessionsUsed + 1)}/${p.sessions}`;
-    }
+
     const bonus = (done.revenue || 0) * THERAPIST_BONUS_RATE;
     log("session_done",
       `Session completed: ${done.clientName} (${done.service}) with ${done.therapist} — session ${counter} · bonus ${fmtEuro(bonus)} (${fmtEuro(done.revenue)})`);
   };
 
-  const cancelBooking = (id) => {
+  const cancelBooking = async (id) => {
     const c = bookings.find((x) => x.id === id);
     if (!c) return;
+    await supabase.from("bookings").update({ status: "cancelled" }).eq("id", id);
     setBookings((b) => b.map((x) => (x.id === id ? { ...x, status: "cancelled" } : x)));
     log("booking_cancelled",
       `Cancelled ${c.clientName} with ${c.therapist} • ${niceDate(c.date)} ${c.time}`);
   };
 
-  const moveBooking = (id, newDate, newTime, newRoom) => {
+  const moveBooking = async (id, newDate, newTime, newRoom) => {
     const prev = bookings.find((x) => x.id === id);
     if (!prev) return;
+    await supabase.from("bookings").update({ date: newDate, time: newTime, room: newRoom, status: "booked" }).eq("id", id);
     setBookings((b) => b.map((x) =>
       x.id === id ? { ...x, date: newDate, time: newTime, room: newRoom, status: "booked" } : x));
     log("booking_moved",
       `Moved ${prev.clientName}: ${niceDate(prev.date)} ${prev.time} → ${niceDate(newDate)} ${newTime} (${newRoom})`);
   };
 
-  const deleteBooking = (id) => {
+  const deleteBooking = async (id) => {
     const bk = bookings.find((x) => x.id === id);
+    await supabase.from("bookings").delete().eq("id", id);
     setBookings((b) => b.filter((x) => x.id !== id));
     if (bk) log("booking_deleted", `Removed booking for ${bk.clientName} • ${niceDate(bk.date)} ${bk.time}`);
   };
