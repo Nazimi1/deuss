@@ -118,7 +118,7 @@ const therapistSoft = (name) => THERAPISTS.find((t) => t.name === name)?.soft ||
 /* ============================================================
    Root
    ============================================================ */
-export default function App() {
+export default function App({ onLogout }) {
   const [tab, setTab] = useState("dashboard");
   const [clients, setClients] = useState([]);
   const [bookings, setBookings] = useState([]);
@@ -380,9 +380,19 @@ export default function App() {
           })}
         </nav>
         <div style={S.sideFoot}>
-          <div style={{ fontSize: 11, color: "#6f6f68", lineHeight: 1.6 }}>
+          <div style={{ fontSize: 11, color: "#6f6f68", lineHeight: 1.6, marginBottom: 10 }}>
             {ROOM_COUNT} rooms · 08:00–20:00<br />Bonus {Math.round(THERAPIST_BONUS_RATE * 100)}%
           </div>
+          {onLogout && (
+            <button
+              className="navbtn"
+              onClick={onLogout}
+              style={{ ...S.navBtn, width: "100%", justifyContent: "flex-start" }}
+            >
+              <X size={16} color="#9b9b95" strokeWidth={1.8} />
+              <span style={{ color: "#cfcfc8", fontSize: 13 }}>Sign out</span>
+            </button>
+          )}
         </div>
       </aside>
 
